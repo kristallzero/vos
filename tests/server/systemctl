@@ -8,6 +8,34 @@ set -euo pipefail
 # A real systemd manager never inherits the installer's flock descriptor.
 exec 9>&-
 mkdir -p /tmp/test-units
+process_alive(){
+  local state
+  [[ $1 =~ ^[1-9][0-9]*$ ]] || return 1
+  state=$(ps -o stat= -p "$1") || return 1
+  # Container PID 1 may leave exited services as zombies; kill -0 accepts them.
+  [[ -n $state && $state != Z* ]]
+}
+wait_stopped(){
+  local pid=$1
+  for _ in {1..100}; do
+    if ! process_alive "$pid"; then return 0; fi
+    sleep 0.05
+  done
+  echo "test systemctl: timed out stopping $unit (PID $pid)" >&2
+  return 1
+}
+wait_started(){
+  local pid=$1 listeners
+  for _ in {1..100}; do
+    if ! process_alive "$pid"; then break; fi
+    listeners=$(ss -H -ltnp)
+    if [[ $listeners == *"pid=$pid,"* ]]; then return 0; fi
+    sleep 0.05
+  done
+  echo "test systemctl: $unit (PID $pid) failed to listen" >&2
+  cat "/tmp/$unit.log" >&2
+  return 1
+}
 command=$1; shift
 case "$command" in
   daemon-reload) exit 0;;
@@ -17,10 +45,16 @@ case "$command" in
   is-active)
     quiet=0; if [[ ${1:-} == --quiet ]]; then quiet=1; shift; fi
     unit=$1; pid=$(cat "/tmp/test-units/$unit.pid" 2>/dev/null || true)
-    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then ((quiet)) || echo active; else ((quiet)) || echo inactive; exit 3; fi;;
+    if process_alive "$pid"; then ((quiet)) || echo active; else ((quiet)) || echo inactive; exit 3; fi;;
   stop)
-    for unit in "$@"; do pid=$(cat "/tmp/test-units/$unit.pid" 2>/dev/null || true); if [[ -n $pid ]]; then kill "$pid" 2>/dev/null || true; fi; rm -f "/tmp/test-units/$unit.pid"; done
-    sleep 0.1;;
+    for unit in "$@"; do
+      pid=$(cat "/tmp/test-units/$unit.pid" 2>/dev/null || true)
+      if [[ -n $pid ]]; then
+        kill "$pid" 2>/dev/null || true
+        wait_stopped "$pid"
+      fi
+      rm -f "/tmp/test-units/$unit.pid"
+    done;;
   restart|start)
     for unit in "$@"; do
       if [[ $command == restart ]]; then "$0" stop "$unit"; fi
@@ -29,14 +63,18 @@ case "$command" in
       read -r -a argv <<< "$exec_line"
       if [[ $unit == vos-relay.service ]]; then
         install -d -o vos-relay -g vos-relay -m 0750 /run/vos
-        runuser -u vos-relay -- "${argv[@]}" >"/tmp/$unit.log" 2>&1 &
-        # ss reports the actual relay PID rather than runuser's supervisor PID.
-        supervisor=$!; sleep 0.2; pid=$(pgrep -P "$supervisor" | head -n 1)
+        # setpriv execs the relay, so $! is the service PID without a supervisor.
+        setpriv --reuid=vos-relay --regid=vos-relay --init-groups -- "${argv[@]}" >"/tmp/$unit.log" 2>&1 & pid=$!
       else
         "${argv[@]}" >"/tmp/$unit.log" 2>&1 & pid=$!
       fi
       echo "$pid" > "/tmp/test-units/$unit.pid"
-      sleep 0.2
+      if ! wait_started "$pid"; then
+        kill "$pid" 2>/dev/null || true
+        wait_stopped "$pid"
+        rm -f "/tmp/test-units/$unit.pid"
+        exit 1
+      fi
     done;;
   *) echo "unsupported test systemctl command: $command" >&2; exit 1;;
 esac

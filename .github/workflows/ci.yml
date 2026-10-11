@@ -50,7 +50,10 @@ jobs:
       - name: Check Go formatting
         run: test -z "$(gofmt -l core cmd internal scripts/collect-licenses.go)"
       - name: Check shell syntax
-        run: bash -n server/install.sh scripts/build.sh tests/server/test.sh tests/server/tun-smoke.sh tests/server/systemctl
+        run: |
+          for script in server/install.sh scripts/build.sh tests/server/test.sh tests/server/tun-smoke.sh tests/server/systemctl tests/server/systemctl-test.sh; do
+            bash -n "$script"
+          done
       - run: go mod download
       - name: Check dependency metadata and notices
         run: |

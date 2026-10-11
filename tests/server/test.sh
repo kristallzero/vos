@@ -2,8 +2,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 VoS contributors.
 
-set -euo pipefail
-shellcheck /install.sh
+set -Eeuo pipefail
+shellcheck /install.sh /usr/local/bin/systemctl /systemctl-test.sh
+bash /systemctl-test.sh
+diagnostics(){
+  local failure_status=$1 line=$2 log
+  echo "FAIL: installer test line $line (exit $failure_status)" >&2
+  for log in /tmp/vos-*.service.log; do
+    [[ -f $log ]] || continue
+    echo "=== $log ===" >&2
+    cat "$log" >&2
+  done
+}
+trap 'diagnostics "$?" "$LINENO"' ERR
 ssh-keygen -q -t ed25519 -N '' -f /tmp/client
 args=(--binary /vos --user vos-test --create-user --public-key /tmp/client.pub --port 14443)
 bash /install.sh "${args[@]}"
@@ -31,7 +42,11 @@ sleep 0.2
 bash /install.sh "${args[@]}"
 before=$(sha256sum /etc/vos/sshd_config /etc/vos/relay.json /usr/local/lib/vos/vos)
 touch /tmp/fail-once
-if bash /install.sh "${args[@]}" --port 14444; then echo 'failure injection unexpectedly succeeded' >&2; exit 1; fi
+if bash /install.sh "${args[@]}" --port 14444; then
+  echo 'failure injection unexpectedly succeeded' >&2; exit 1
+else
+  [[ $? == 1 && ! -f /tmp/fail-once ]]
+fi
 [[ $before == "$(sha256sum /etc/vos/sshd_config /etc/vos/relay.json /usr/local/lib/vos/vos)" ]]
 systemctl is-active --quiet vos-sshd.service
 systemctl is-active --quiet vos-relay.service
