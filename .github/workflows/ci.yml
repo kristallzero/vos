@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go mod download
+      - run: go mod verify
+      - run: go test -race -tags with_gvisor ./...
+      - run: go vet -tags with_gvisor ./...
+      - name: Scan known vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -tags with_gvisor ./...
+
+  hygiene:
+    name: Formatting and dependency notices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l core cmd internal scripts/collect-licenses.go)"
+      - name: Check shell syntax
+        run: bash -n server/install.sh scripts/build.sh tests/server/test.sh tests/server/tun-smoke.sh tests/server/systemctl
+      - run: go mod download
+      - name: Check dependency metadata and notices
+        run: |
+          go mod tidy -diff
+          go run scripts/collect-licenses.go
+          git diff --exit-code -- THIRD_PARTY_NOTICES.txt
+      - name: Check whitespace
+        run: git diff --check
+
+  build:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: bash scripts/build.sh
+      - name: Prepare artifact with licenses and source reference
+        env:
+          TARGET: ${{ matrix.goos }}-${{ matrix.goarch }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p "dist/$TARGET"
+          cp bin/* "dist/$TARGET/"
+          cp LICENSE README.md THIRD_PARTY.md THIRD_PARTY_NOTICES.txt "dist/$TARGET/"
+          cp -R licenses "dist/$TARGET/"
+          printf 'Corresponding source: https://github.com/kristallzero/vos/tree/%s\n' "$SOURCE_COMMIT" > "dist/$TARGET/SOURCE.txt"
+          (cd "dist/$TARGET" && sha256sum vos-* > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vos-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/${{ matrix.goos }}-${{ matrix.goarch }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  installer:
+    name: Debian installer and Linux TUN
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+      - name: Build Linux relay
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: bash scripts/build.sh
+      - run: docker build -f tests/server/Dockerfile -t vos-installer-test:local .
+      - name: Check install, upgrade, rollback, and reuse
+        run: docker run --rm --network none --cap-add SYS_PTRACE vos-installer-test:local
+      - name: Check isolated TUN lifecycle
+        run: |
+          test -c /dev/net/tun
+          docker run --rm --network none --cap-add SYS_PTRACE --cap-add NET_ADMIN \
+            --device /dev/net/tun --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv6.conf.default.disable_ipv6=0 \
+            vos-installer-test:local bash /tun-smoke.sh

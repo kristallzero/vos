@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 VoS contributors.
+
+# Test-only service lifecycle shim: run real sshd/relay in an unprivileged container.
+# This checks installer transactions; it does not pretend to test a systemd boot.
+set -euo pipefail
+# A real systemd manager never inherits the installer's flock descriptor.
+exec 9>&-
+mkdir -p /tmp/test-units
+command=$1; shift
+case "$command" in
+  daemon-reload) exit 0;;
+  show) unit=$1; if [[ -f /tmp/test-units/$unit.pid ]]; then cat "/tmp/test-units/$unit.pid"; else echo 0; fi;;
+  is-enabled) unit=$1; if [[ -f /tmp/test-units/$unit.enabled ]]; then echo enabled; else echo disabled; exit 1; fi;;
+  enable|disable) for unit in "$@"; do if [[ $command == enable ]]; then touch "/tmp/test-units/$unit.enabled"; else rm -f "/tmp/test-units/$unit.enabled"; fi; done;;
+  is-active)
+    quiet=0; if [[ ${1:-} == --quiet ]]; then quiet=1; shift; fi
+    unit=$1; pid=$(cat "/tmp/test-units/$unit.pid" 2>/dev/null || true)
+    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then ((quiet)) || echo active; else ((quiet)) || echo inactive; exit 3; fi;;
+  stop)
+    for unit in "$@"; do pid=$(cat "/tmp/test-units/$unit.pid" 2>/dev/null || true); if [[ -n $pid ]]; then kill "$pid" 2>/dev/null || true; fi; rm -f "/tmp/test-units/$unit.pid"; done
+    sleep 0.1;;
+  restart|start)
+    for unit in "$@"; do
+      if [[ $command == restart ]]; then "$0" stop "$unit"; fi
+      if [[ -f /tmp/fail-once && $unit == vos-sshd.service ]]; then rm /tmp/fail-once; exit 1; fi
+      exec_line=$(sed -n 's/^ExecStart=//p' "/etc/systemd/system/$unit")
+      read -r -a argv <<< "$exec_line"
+      if [[ $unit == vos-relay.service ]]; then
+        install -d -o vos-relay -g vos-relay -m 0750 /run/vos
+        runuser -u vos-relay -- "${argv[@]}" >"/tmp/$unit.log" 2>&1 &
+        # ss reports the actual relay PID rather than runuser's supervisor PID.
+        supervisor=$!; sleep 0.2; pid=$(pgrep -P "$supervisor" | head -n 1)
+      else
+        "${argv[@]}" >"/tmp/$unit.log" 2>&1 & pid=$!
+      fi
+      echo "$pid" > "/tmp/test-units/$unit.pid"
+      sleep 0.2
+    done;;
+  *) echo "unsupported test systemctl command: $command" >&2; exit 1;;
+esac
